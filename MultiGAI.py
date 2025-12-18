@@ -271,7 +271,7 @@ class multigai(nn.Module):
         logvar = self.l_net(attn)
         var = torch.exp(logvar) + 1e-8
 
-        return mu, var, attn1, attn2, attn3, attn
+        return mu, var, attn1, attn2, attn3, ae, attn
 
     def decode_from_z(self, dz, m1, m2, m3, m, batch):
         """
@@ -351,7 +351,7 @@ class multigai(nn.Module):
                 q3 = self.q_net3(e3)
 
         # ===== Latent inference =====
-        mu, var, a1, a2, a3, ae = self.compute_mu_var(device, q1, q2, q3, m)
+        mu, var, a1, a2, a3, aq, ae = self.compute_mu_var(device, q1, q2, q3, m)
         var = torch.clamp(var, min=1e-6)
 
         qz = Normal(mu, var.sqrt())
@@ -361,7 +361,7 @@ class multigai(nn.Module):
         # ===== Decode =====
         p1, p2, p3 = self.decode_from_z(z, m1, m2, m3, m, batch)
 
-        return z, p1, p2, p3, qz, pz, a1, a2, a3, ae
+        return z, p1, p2, p3, qz, pz, a1, a2, a3, aq, ae
 
     def loss_function(self, m1, m2, m3, m, p1, p2, p3, q, p, a1, a2, a3, w):
         """
@@ -543,7 +543,7 @@ def rnaatacmapping(output_path, adata, *args, num_epochs=200):
                     m1, m2, m3, m_tensor, batch_tensor, idx = [x.to(device) for x in sub_batch]
 
                     # Forward pass
-                    z, p1, p2, p3, qz, pz, a1, a2, a3, ae = model(
+                    z, p1, p2, p3, qz, pz, a1, a2, a3, aq, ae = model(
                         m1, m2, m3, int(m_curr.item()), batch_tensor
                     )
 
@@ -570,7 +570,7 @@ def rnaatacmapping(output_path, adata, *args, num_epochs=200):
                 if mask.any():
                     sub_batch = [d[mask] for d in batch_data]
                     m1, m2, m3, _, batch_tensor, idx = [x.to(device) for x in sub_batch]
-                    z, p1, p2, p3, qz, pz, a1, a2, a3, ae = model(
+                    z, p1, p2, p3, qz, pz, a1, a2, a3, aq, ae = model(
                         m1, m2, m3, int(m_curr.item()), batch_tensor
                     )
             z1_list.append(z)
@@ -812,7 +812,7 @@ def rnaadtmapping(output_path, adata, *args, num_epochs=200):
                     m1, m2, m3, m_tensor, batch_tensor, idx = [x.to(device) for x in sub_batch]
 
                     # Forward pass
-                    z, p1, p2, p3, qz, pz, a1, a2, a3, ae = model(
+                    z, p1, p2, p3, qz, pz, a1, a2, a3, aq, ae = model(
                         m1, m2, m3, int(m_curr.item()), batch_tensor
                     )
                     # Compute loss
@@ -843,7 +843,7 @@ def rnaadtmapping(output_path, adata, *args, num_epochs=200):
                     m1, m2, m3, _, batch_tensor, idx = [x.to(device) for x in sub_batch]
 
                     # Forward pass
-                    z, p1, p2, p3, qz, pz, a1, a2, a3, ae = model(
+                    z, p1, p2, p3, qz, pz, a1, a2, a3, aq, ae = model(
                         m1, m2, m3, int(m_curr.item()), batch_tensor
                     )
             
@@ -1024,6 +1024,8 @@ def rnaatacadtmappingandimputing(output_path, rna, atac, adt, *args, num_epochs=
             Number of key-value (K-V) pairs in attention
         genes_of_interest : list[str]
             List of genes to extract predicted values for
+        peaks_of_interest : list[str]
+            List of peaks to extract predicted values for
         adts_of_interest : list[str]
             List of ADT proteins to extract predicted values for
     num_epochs : int, optional
@@ -1035,7 +1037,7 @@ def rnaatacadtmappingandimputing(output_path, rna, atac, adt, *args, num_epochs=
         Results are stored in rna.obsm and written to the specified h5ad file.
     """
     
-    n_hidden, hidden, z_dim, q_dim, kv_n, genes_of_interest, adts_of_interest = args
+    n_hidden, hidden, z_dim, q_dim, kv_n, genes_of_interest, peaks_of_interest, adts_of_interest = args
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     z1_index = rna.obs_names[rna.obs["Modality"] == "multiome"].tolist()
@@ -1092,7 +1094,7 @@ def rnaatacadtmappingandimputing(output_path, rna, atac, adt, *args, num_epochs=
                     sub_batch = [d[mask] for d in batch_data]
                     m1, m2, m3, m_tensor, batch_tensor, idx = [x.to(device) for x in sub_batch]
 
-                    z, p1, p2, p3, qz, pz, a1, a2, a3, ae = model(
+                    z, p1, p2, p3, qz, pz, a1, a2, a3, aq, ae = model(
                         m1, m2, m3, int(m_curr), batch_tensor
                     )
                     loss, reconst_loss, kl_loss, cos_loss = model.loss_function(
@@ -1129,7 +1131,7 @@ def rnaatacadtmappingandimputing(output_path, rna, atac, adt, *args, num_epochs=
                 batch_sub = batch_tensor[mask]
                 obs_names_sub = [obs_names[i] for i, flag in enumerate(mask.cpu().numpy()) if flag]
 
-                z, p1, p2, p3, qz, pz, a1, a2, a3, ae = model(
+                z, p1, p2, p3, qz, pz, a1, a2, a3, aq, ae = model(
                     m1_sub, m2_sub, m3_sub, int(m_val.item()), batch_sub
                 )
 
@@ -1313,12 +1315,15 @@ def rnaatacadtmappingandimputing(output_path, rna, atac, adt, *args, num_epochs=
 
     # Get the indices of genes of interest in rna.var.index
     gene_idx = [rna.var.index.get_loc(g) for g in genes_of_interest]
+    
+    # Get the indices of peaks of interest in atac.var.index
+    peak_idx = [atac.var.index.get_loc(g) for g in peaks_of_interest]
 
     # Get the indices of ADTs of interest in adt.var.index
     adt_idx  = [adt.var.index.get_loc(a) for a in adts_of_interest]
 
-    # Combine genes and ADTs into a single 'interest' list
-    interest = genes_of_interest + adts_of_interest
+    # Combine genes ,peaks and ADTs into a single 'interest' list
+    interest = genes_of_interest + peaks_of_interest + adts_of_interest
     interest_idx_map = {name: i for i, name in enumerate(interest)}  # Map name → column index
 
     # Initialize prediction matrix with NaNs (shape: n_cells × n_features of interest)
@@ -1348,6 +1353,11 @@ def rnaatacadtmappingandimputing(output_path, rna, atac, adt, *args, num_epochs=
             scale1 = model.fc_scale1(final)
             dropout1 = model.fc_dropout1(final)
             expectation1 = (1 - torch.sigmoid(dropout1)) * scale1  # Corrected expectation for RNA
+            
+            # ATAC prediction (p2)
+            scale2 = model.fc_scale2(final)
+            dropout2 = model.fc_dropout2(final)
+            expectation2 = (1 - torch.sigmoid(dropout2)) * scale2
 
             # ADT prediction (p3)
             scale3 = model.fc_scale3(final)
@@ -1359,6 +1369,10 @@ def rnaatacadtmappingandimputing(output_path, rna, atac, adt, *args, num_epochs=
             # Store RNA predictions in pred_matrix
             for j, g in enumerate(genes_of_interest):
                 pred_matrix[idx_range, interest_idx_map[g]] = expectation1[:, gene_idx[j]]
+            
+            # Store ATAC predictions in pred_matrix
+            for j, a in enumerate(peaks_of_interest):
+                pred_matrix[idx_range, interest_idx_map[a]] = expectation2[:, peak_idx[j]]
 
             # Store ADT predictions in pred_matrix
             for j, a in enumerate(adts_of_interest):
@@ -1442,7 +1456,7 @@ def train_and_evaluate_model(
                     ]
 
                     # Forward pass
-                    z, p1, p2, p3, qz, pz, a1, a2, a3, ae = model(
+                    z, p1, p2, p3, qz, pz, a1, a2, a3, aq, ae = model(
                         m1, m2, m3,
                         int(m_curr.item()),
                         batch_tensor
@@ -1499,7 +1513,7 @@ def train_and_evaluate_model(
                     ]
 
                     # Encode to latent space
-                    z, _, _, _, _, _, _, _, _, _ = model(
+                    z, _, _, _, _, _, _, _, _, _, _ = model(
                         m1, m2, m3,
                         int(m_curr.item()),
                         batch_tensor
