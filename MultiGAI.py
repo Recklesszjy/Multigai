@@ -118,7 +118,6 @@ class multigai(nn.Module):
         hidden,
         z_dim,
         batch_dim,
-        q_dim=128,
         kv_n=64,
         dropout_rate=0.1
     ):
@@ -126,7 +125,6 @@ class multigai(nn.Module):
 
         # ===== Hyperparameters =====
         self.kv_n = kv_n              # Number of key/value tokens
-        self.q_dim = q_dim            # Query embedding dimension
         self.z_dim = z_dim            # Latent space dimension
         self.batch_dim = batch_dim    # Batch covariate dimension
         self.hidden = hidden          # Hidden layer width
@@ -147,6 +145,7 @@ class multigai(nn.Module):
                     )
                 )
                 in_dim = hidden
+            layers.append(nn.Linear(hidden, hidden))
             return nn.Sequential(*layers)
 
         # ===== Modality-specific encoders =====
@@ -154,20 +153,13 @@ class multigai(nn.Module):
         self.encoder2 = make_encoder(input_dim2)
         self.encoder3 = make_encoder(input_dim3)
 
-        # ===== Projection to query space =====
-        self.q_net1 = nn.Linear(hidden, q_dim)
-        self.q_net2 = nn.Linear(hidden, q_dim)
-        self.q_net3 = nn.Linear(hidden, q_dim)
-
         # ===== Key / Value network constructor =====
-        def make_kv(is_value):
-            """
-            Build key/value networks for attention-based latent fusion.
-            """
-            layers = []
+        def make_kv():
+
+            layers_k = []
             in_dim = kv_n
             for _ in range(n_hidden):
-                layers.append(
+                layers_k.append(
                     nn.Sequential(
                         nn.Linear(in_dim, hidden),
                         nn.LayerNorm(hidden),
@@ -176,21 +168,33 @@ class multigai(nn.Module):
                     )
                 )
                 in_dim = hidden
-            if not is_value:
-                layers.append(nn.Linear(hidden, q_dim))
-            return nn.Sequential(*layers)
+            layers_k.append(nn.Linear(hidden, hidden))
+            key_net = nn.Sequential(*layers_k)
+
+            layers_v = []
+            in_dim = kv_n
+            for _ in range(n_hidden):
+                layers_v.append(
+                    nn.Sequential(
+                        nn.Linear(in_dim, hidden),
+                        nn.LayerNorm(hidden),
+                        nn.ReLU(),
+                        nn.Dropout(dropout_rate)
+                    )
+                )
+                in_dim = hidden
+            value_net = nn.Sequential(*layers_v)
+
+            return key_net, value_net
 
         # ===== Modality-specific key/value banks =====
-        self.keys1 = make_kv(is_value=False)
-        self.values1 = make_kv(is_value=True)
-        self.keys2 = make_kv(is_value=False)
-        self.values2 = make_kv(is_value=True)
-        self.keys3 = make_kv(is_value=False)
-        self.values3 = make_kv(is_value=True)
+        self.keys1, self.values1 = make_kv()
+        self.keys2, self.values2 = make_kv()
+        self.keys3, self.values3 = make_kv()
 
         # ===== Shared key/value banks =====
-        self.keys = make_kv(is_value=False)
-        self.values = make_kv(is_value=True)
+        self.keys, self.values = make_kv()
+
 
         # ===== Latent Gaussian parameter heads =====
         self.m_net = nn.Linear(hidden, z_dim)   # Mean of q(z|x)
@@ -237,7 +241,7 @@ class multigai(nn.Module):
         of modality-specific query embeddings.
         """
         I = torch.eye(self.kv_n, device=device)   # Identity tokens
-        scale = math.sqrt(self.q_dim)
+        scale = math.sqrt(self.hidden)
 
         attn1 = attn2 = attn3 = None
 
@@ -339,16 +343,13 @@ class multigai(nn.Module):
         # ===== Encode =====
         q1 = q2 = q3 = None
         if m in [12, 13]:
-            e1 = self.encoder1(m1)
-            q1 = self.q_net1(e1)
+            q1 = self.encoder1(m1)
 
             if m == 12:
-                e2 = self.encoder2(m2)
-                q2 = self.q_net2(e2)
+                q2 = self.encoder2(m2)
 
             if m == 13:
-                e3 = self.encoder3(m3)
-                q3 = self.q_net3(e3)
+                q3 = self.encoder3(m3)
 
         # ===== Latent inference =====
         mu, var, a1, a2, a3, aq, ae = self.compute_mu_var(device, q1, q2, q3, m)
@@ -391,6 +392,182 @@ class multigai(nn.Module):
 
         loss = reconst_loss + w * kl + cos_loss
         return loss, reconst_loss, kl, cos_loss
+
+class multigai_spatial(nn.Module):
+
+    def __init__(
+        self,
+        rna_dim,
+        spatial_input_dim,
+        n_hidden,
+        hidden,
+        z_dim,
+        batch_dim,
+        kv_n,
+        num_slices, 
+        d_slice,
+        dropout_rate=0.1
+    ):
+        super().__init__()
+
+        self.kv_n = kv_n            
+        self.z_dim = z_dim          
+        self.batch_dim = batch_dim   
+        self.hidden = hidden    
+
+        self.slice_embedding = nn.Embedding(num_slices, d_slice)     
+
+        def make_encoder(in_dim):
+
+            layers = []
+            for _ in range(n_hidden):
+                layers.append(
+                    nn.Sequential(
+                        nn.Linear(in_dim, hidden),
+                        nn.LayerNorm(hidden),
+                        nn.ReLU(),
+                        nn.Dropout(dropout_rate)
+                    )
+                )
+                in_dim = hidden
+            layers.append(nn.Linear(hidden, hidden))
+            return nn.Sequential(*layers)
+
+        self.encoder = make_encoder(rna_dim)
+        self.encoder_s = make_encoder(spatial_input_dim)
+
+        def make_kv():
+
+            layers_k = []
+            in_dim = kv_n
+            for _ in range(n_hidden):
+                layers_k.append(
+                    nn.Sequential(
+                        nn.Linear(in_dim, hidden),
+                        nn.LayerNorm(hidden),
+                        nn.ReLU(),
+                        nn.Dropout(dropout_rate)
+                    )
+                )
+                in_dim = hidden
+            layers_k.append(nn.Linear(hidden, hidden))
+            key_net = nn.Sequential(*layers_k)
+
+            layers_v = []
+            in_dim = kv_n
+            for _ in range(n_hidden):
+                layers_v.append(
+                    nn.Sequential(
+                        nn.Linear(in_dim, hidden),
+                        nn.LayerNorm(hidden),
+                        nn.ReLU(),
+                        nn.Dropout(dropout_rate)
+                    )
+                )
+                in_dim = hidden
+            value_net = nn.Sequential(*layers_v)
+
+            return key_net, value_net
+
+        self.keys, self.values = make_kv()
+
+        self.keys_sh, self.values_sh = make_kv()
+
+        self.m_net = nn.Linear(hidden, z_dim)
+        self.l_net = nn.Linear(hidden, z_dim)
+
+        self.decoder_base = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(z_dim + batch_dim if i == 0 else hidden + batch_dim, hidden),
+                nn.LayerNorm(hidden),
+                nn.ReLU(),
+                nn.Dropout(dropout_rate)
+            ) for i in range(n_hidden)
+        ])
+
+        self.fc_scale = nn.Sequential(
+            nn.Linear(hidden + batch_dim, rna_dim),
+            nn.Softmax(dim=-1)
+        )
+        self.fc_dropout = nn.Linear(hidden + batch_dim, rna_dim)
+        self.fc_r = nn.Parameter(torch.randn(rna_dim)) 
+
+        self.fc_out2 = nn.Sequential(
+            nn.Linear(hidden + batch_dim, 2)
+        )
+
+    def forward(self, rna, spatial, batch):
+
+        device = batch.device
+        batch_size = rna.size(0)
+
+        q = self.encoder(rna)
+        q_s = self.encoder_s(spatial)
+
+        I = torch.eye(self.kv_n, device=device) 
+        scale = math.sqrt(self.hidden)
+
+        ker, val = self.keys(I), self.values(I)
+
+        aq = torch.softmax((q @ ker.T) / scale, dim=-1) @ val
+        
+        eq = (aq + q_s) / 2.0
+
+        ker_sh, val_sh = self.keys_sh(I), self.values_sh(I)
+        attn = torch.softmax((eq @ ker_sh.T) / scale, dim=-1) @ val_sh
+
+        mu = self.m_net(attn)
+        logvar = self.l_net(attn)
+        var = torch.exp(logvar) + 1e-8
+        var = torch.clamp(var, min=1e-6)
+
+        qz = Normal(mu, var.sqrt())
+        z = qz.rsample()
+        pz = Normal(torch.zeros_like(z), torch.ones_like(z))
+        
+        dz = z
+
+        for layer in self.decoder_base:
+            dz = torch.cat([dz, batch], dim=1)
+            dz = layer(dz)
+
+        final = torch.cat([dz, batch], dim=1)
+
+        scale = self.fc_scale(final)
+        dropout = self.fc_dropout(final)
+        library = torch.log(rna.sum(1, keepdim=True) + 1e-8)
+        rate = torch.exp(library) * scale
+
+        p = ZeroInflatedNegativeBinomial(
+            mu=rate,
+            theta=torch.exp(self.fc_r),
+            zi_logits=dropout,
+            scale=scale
+        )
+
+        out2 = self.fc_out2(final)
+
+        return z, p, qz, pz, out2, aq, q_s, attn 
+
+    def loss_function(self, rna, p, spatial, out2, qz, pz, aq, q_s, w):
+
+        reconst_loss = -p.log_prob(rna).sum(-1).mean()
+
+        out2_coord  = out2
+        spatial_coord  = spatial
+
+        batch_size = out2_coord.shape[0]
+        loss_coord = F.mse_loss(out2_coord, spatial_coord, reduction='sum') / batch_size
+        loss_spatial = loss_coord 
+
+        kl = torch.distributions.kl_divergence(qz, pz).sum(dim=-1).mean()
+
+        cos_sim = F.cosine_similarity(aq, q_s, dim=-1)
+        loss_cos = (1 - cos_sim).mean()
+
+        loss = reconst_loss + 100 * loss_spatial + w * kl + loss_cos
+
+        return loss, reconst_loss, loss_spatial, kl, loss_cos
 
 class M2L(nn.Module):
     def __init__(self, input_dim, output_dim, hidden_dim=1024, dropout_p=0.1):
@@ -443,6 +620,53 @@ class MultiOmicsDataset(Dataset):
 
         return m1, m2, m3, m, batch, idx   
     
+# === MLP Distillation Training Function ===
+def train_mlp(x_tensor, y_tensor, input_dim, output_dim, epochs=200):
+    
+    device = x_tensor.device
+    # Create a dataset and dataloader
+    dataset = torch.utils.data.TensorDataset(x_tensor, y_tensor)
+    loader = DataLoader(dataset, batch_size=512, shuffle=True)
+
+    # Initialize MLP model, optimizer, and loss function
+    mlp = M2L(input_dim, output_dim).to(device)
+    optimizer = Adam(mlp.parameters(), lr=1e-3)
+    criterion = nn.MSELoss()
+
+    # Training loop
+    mlp.train()
+    tqdm_bar = tqdm(range(epochs), desc="MLP Training Progress")
+    for epoch in tqdm_bar:
+        running_loss = 0.0
+        for x, y in loader:
+            optimizer.zero_grad()
+            x, y = x.to(device), y.to(device)
+
+            # Forward pass
+            y_pred = mlp(x)
+
+            # Compute MSE loss
+            loss = criterion(y_pred, y)
+
+            # Backpropagation
+            loss.backward()
+            optimizer.step()
+
+            # Accumulate loss
+            running_loss += loss.item()
+
+        # Compute average loss for the epoch
+        avg_loss = running_loss / len(loader)
+
+        # Update tqdm postfix with current loss
+        tqdm_bar.set_postfix({"loss": f"{avg_loss:.4f}"})
+
+        # Optional: print every 50 epochs
+        if (epoch + 1) % 50 == 0:
+            print(f"[MLP Epoch {epoch+1}/{epochs}] Loss: {avg_loss:.4f}")
+
+    return mlp
+
 def rnaatacmapping(output_path, adata, *args, num_epochs=200):
 
     """
@@ -467,8 +691,6 @@ def rnaatacmapping(output_path, adata, *args, num_epochs=200):
             Hidden dimension for all layers in the network
         z_dim : int
             Dimension of the latent space
-        q_dim : int
-            Dimension of the query vector (Q) in attention
         kv_n : int
             Number of key-value (K-V) pairs in attention
     num_epochs : int, optional
@@ -481,7 +703,7 @@ def rnaatacmapping(output_path, adata, *args, num_epochs=200):
     """
     
     # Unpack model parameters
-    n_hidden, hidden, z_dim, q_dim, kv_n = args
+    n_hidden, hidden, z_dim, kv_n = args
 
     # Set device
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -521,28 +743,37 @@ def rnaatacmapping(output_path, adata, *args, num_epochs=200):
     test1_loader = DataLoader(dataset_t, batch_size=512, shuffle=False)
 
     # === Initialize model ===
-    model = multigai(rna_dim, atac_dim, adt_dim, n_hidden, hidden, z_dim, batch_encoded.shape[1], q_dim, kv_n).to(device)
+    model = multigai(rna_dim, atac_dim, adt_dim, n_hidden, hidden, z_dim, batch_encoded.shape[1], kv_n).to(device)
     optimizer_main = Adam(model.parameters(), lr=0.001)
     scheduler_main = torch.optim.lr_scheduler.StepLR(optimizer_main, step_size=50, gamma=0.9)
 
-    # === Train main model ===
-    for epoch in range(num_epochs):
+    # Create a global progress bar for epochs
+    tqdm_bar = tqdm(range(num_epochs), desc="Training Progress")
+
+    for epoch in tqdm_bar:
         running_loss = 0.0
-        kl_weight = 0.0 if epoch < 100 else 0.1  # KL loss not weighted for first 100 epochs
+        running_recon = 0.0
+        running_kl = 0.0
+
+        # Set KL weight: not applied for first 100 epochs
+        kl_weight = 0.0 if epoch < 100 else 0.1
         model.train()
+
+        # Iterate over training batches
         for batch_data in train_loader:
             optimizer_main.zero_grad()
-            m_values = batch_data[3]  # modality labels
-            unique_m = m_values.unique()  # all modalities in this batch
+            m_values = batch_data[3]          # modality labels
+            unique_m = m_values.unique()      # all modalities present in this batch
 
-            # Split sub-batch by modality
+            # Split batch by modality
             for m_curr in unique_m:
                 mask = (m_values == m_curr)
                 if mask.any():
+                    # Sub-batch for the current modality
                     sub_batch = [d[mask] for d in batch_data]
                     m1, m2, m3, m_tensor, batch_tensor, idx = [x.to(device) for x in sub_batch]
 
-                    # Forward pass
+                    # Forward pass through the model
                     z, p1, p2, p3, qz, pz, a1, a2, a3, aq, ae = model(
                         m1, m2, m3, int(m_curr.item()), batch_tensor
                     )
@@ -553,10 +784,27 @@ def rnaatacmapping(output_path, adata, *args, num_epochs=200):
                     )
                     loss.backward()
                     optimizer_main.step()
-                    running_loss += loss.item()
 
+                    # Accumulate metrics
+                    running_loss += loss.item()
+                    running_recon += reconst_loss.item()
+                    running_kl += kl_loss.item()
+
+        # Compute average metrics for the epoch
+        n_batches = len(train_loader)
+        avg_loss = running_loss / n_batches
+        avg_recon = running_recon / n_batches
+        avg_kl = running_kl / n_batches
+
+        # Update the global progress bar with metrics
+        tqdm_bar.set_postfix({
+            "loss": f"{avg_loss:.4f}",
+            "recon": f"{avg_recon:.4f}",
+            "kl": f"{avg_kl:.4f}",
+        })
+
+        # Step the learning rate scheduler
         scheduler_main.step()
-        print(f"[Epoch {epoch+1}/{num_epochs}] Loss: {running_loss/len(train_loader):.4f}, KL_weight: {kl_weight}")
 
     # === Extract latent embeddings ===
     model.eval()
@@ -583,28 +831,6 @@ def rnaatacmapping(output_path, adata, *args, num_epochs=200):
     a1_tensor  = torch.cat(a1_list, dim=0)
     a2_tensor  = torch.cat(a2_list, dim=0)
     ae_tensor  = torch.cat(ae_list, dim=0)
-
-    # === MLP distillation ===
-    def train_mlp(x_tensor, y_tensor, input_dim, output_dim, epochs=200):
-        dataset = torch.utils.data.TensorDataset(x_tensor, y_tensor)
-        loader = DataLoader(dataset, batch_size=512, shuffle=True)
-        mlp = M2L(input_dim, output_dim).to(device)
-        optimizer = Adam(mlp.parameters(), lr=1e-3)
-        criterion = nn.MSELoss()
-        mlp.train()
-        for epoch in range(epochs):
-            running_loss = 0.0
-            for x, y in loader:
-                optimizer.zero_grad()
-                x, y = x.to(device), y.to(device)
-                y_pred = mlp(x)
-                loss = criterion(y_pred, y)
-                loss.backward()
-                optimizer.step()
-                running_loss += loss.item()
-            if (epoch+1) % 50 == 0:
-                print(f"[MLP Epoch {epoch+1}/{epochs}] Loss: {running_loss/len(loader):.4f}")
-        return mlp
 
     # Train MLP to map each modality's intermediate embedding to joint embedding
     mlp1 = train_mlp(a1_tensor, ae_tensor, a1_tensor.shape[1], ae_tensor.shape[1])
@@ -642,14 +868,13 @@ def rnaatacmapping(output_path, adata, *args, num_epochs=200):
         batch_size = 512
         a1_list, a2_list = [], []
         I = torch.eye(model.kv_n, device=x_gene_tensor.device)
-        scale = math.sqrt(model.q_dim)
+        scale = math.sqrt(model.hidden)
         model.eval()
         with torch.no_grad():
             # RNA
             for i in range(0, x_gene_tensor.shape[0], batch_size):
                 batch = x_gene_tensor[i:i+batch_size]
-                e1 = model.encoder1(batch)
-                q1 = model.q_net1(e1)
+                q1 = model.encoder1(batch)
                 ker = model.keys1(I)
                 var = model.values1(I)
                 attn_logits1 = (q1 @ ker.T) / scale
@@ -658,8 +883,7 @@ def rnaatacmapping(output_path, adata, *args, num_epochs=200):
             # ATAC
             for i in range(0, x_peaks_tensor.shape[0], batch_size):
                 batch = x_peaks_tensor[i:i+batch_size]
-                e2 = model.encoder2(batch)
-                q2 = model.q_net2(e2)
+                q2 = model.encoder2(batch)
                 kea = model.keys2(I)
                 vaa = model.values2(I)
                 attn_logits2 = (q2 @ kea.T) / scale
@@ -734,8 +958,6 @@ def rnaadtmapping(output_path, adata, *args, num_epochs=200):
             Hidden dimension for all layers in the network
         z_dim : int
             Dimension of the latent space
-        q_dim : int
-            Dimension of the query vector (Q) in attention
         kv_n : int
             Number of key-value (K-V) pairs in attention
     num_epochs : int, optional
@@ -748,7 +970,7 @@ def rnaadtmapping(output_path, adata, *args, num_epochs=200):
     """
 
     # multigai parameters
-    n_hidden, hidden, z_dim, q_dim, kv_n = args
+    n_hidden, hidden, z_dim, kv_n = args
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -789,32 +1011,39 @@ def rnaadtmapping(output_path, adata, *args, num_epochs=200):
     test1_loader = DataLoader(dataset_t, batch_size=512, shuffle=False)
 
     # Initialize the model
-    model = multigai(rna_dim, atac_dim, adt_dim, n_hidden, hidden, z_dim, batch_encoded.shape[1], q_dim, kv_n).to(device)
+    model = multigai(rna_dim, atac_dim, adt_dim, n_hidden, hidden, z_dim, batch_encoded.shape[1], kv_n).to(device)
     optimizer_main = Adam(model.parameters(), lr=0.001)
     scheduler_main = torch.optim.lr_scheduler.StepLR(optimizer_main, step_size=50, gamma=0.9)
 
-    # Train the main model
-    for epoch in range(num_epochs):
+    # === Main Model Training Loop ===
+    tqdm_bar = tqdm(range(num_epochs), desc="Training Progress")
+
+    for epoch in tqdm_bar:
         running_loss = 0.0
+
+        # Set KL weight: not applied for first 100 epochs
         kl_weight = 0.0 if epoch < 100 else 0.1
         model.train()
+
+        # Iterate over training batches
         for batch_data in train_loader:
             optimizer_main.zero_grad()
-
-            m_values = batch_data[3]  # modality indicator
-            unique_m = m_values.unique()
+            m_values = batch_data[3]        # modality indicator for each sample
+            unique_m = m_values.unique()    # unique modalities present in the batch
 
             # Split batch by modality
             for m_curr in unique_m:
                 mask = (m_values == m_curr)
                 if mask.any():
+                    # Sub-batch for the current modality
                     sub_batch = [d[mask] for d in batch_data]
                     m1, m2, m3, m_tensor, batch_tensor, idx = [x.to(device) for x in sub_batch]
 
-                    # Forward pass
+                    # Forward pass through the model
                     z, p1, p2, p3, qz, pz, a1, a2, a3, aq, ae = model(
                         m1, m2, m3, int(m_curr.item()), batch_tensor
                     )
+
                     # Compute loss
                     loss, reconst_loss, kl_loss, cos_loss = model.loss_function(
                         m1, m2, m3, int(m_curr.item()), p1, p2, p3, qz, pz, a1, a2, a3, kl_weight
@@ -822,10 +1051,23 @@ def rnaadtmapping(output_path, adata, *args, num_epochs=200):
                     loss.backward()
                     optimizer_main.step()
 
+                    # Accumulate running loss
                     running_loss += loss.item()
 
+        # Step learning rate scheduler
         scheduler_main.step()
-        print(f"[Epoch {epoch+1}/{num_epochs}] Loss: {running_loss/len(train_loader):.4f}, KL_weight: {kl_weight}")
+
+        # Compute average loss for the epoch
+        avg_loss = running_loss / len(train_loader)
+
+        # Update tqdm postfix with metrics
+        tqdm_bar.set_postfix({
+            "loss": f"{avg_loss:.4f}",
+            "KL_weight": f"{kl_weight:.3f}"
+        })
+
+        # Optional: print epoch info
+        print(f"[Epoch {epoch+1}/{num_epochs}] Loss: {avg_loss:.4f}, KL_weight: {kl_weight}")
 
     model.eval()
     z1_list, a1_list, a3_list, ae_list = [], [], [], []
@@ -858,28 +1100,6 @@ def rnaadtmapping(output_path, adata, *args, num_epochs=200):
     a1_tensor  = torch.cat(a1_list, dim=0)
     a3_tensor  = torch.cat(a3_list, dim=0)
     ae_tensor  = torch.cat(ae_list, dim=0)
-
-    # Train MLPs
-    def train_mlp(x_tensor, y_tensor, input_dim, output_dim, epochs=200):
-        dataset = torch.utils.data.TensorDataset(x_tensor, y_tensor)
-        loader = DataLoader(dataset, batch_size=512, shuffle=True)
-        mlp = M2L(input_dim, output_dim).to(device)
-        optimizer = Adam(mlp.parameters(), lr=1e-3)
-        criterion = nn.MSELoss()
-        mlp.train()
-        for epoch in range(epochs):
-            running_loss = 0.0
-            for x, y in loader:
-                optimizer.zero_grad()
-                x, y = x.to(device), y.to(device)
-                y_pred = mlp(x)
-                loss = criterion(y_pred, y)
-                loss.backward()
-                optimizer.step()
-                running_loss += loss.item()
-            if (epoch+1) % 50 == 0:
-                print(f"[MLP Epoch {epoch+1}/{epochs}] Loss: {running_loss/len(loader):.4f}")
-        return mlp
 
     # Train MLP to map intermediate embeddings to joint latent
     mlp1 = train_mlp(a1_tensor, ae_tensor, a1_tensor.shape[1], ae_tensor.shape[1])  # RNA
@@ -921,14 +1141,13 @@ def rnaadtmapping(output_path, adata, *args, num_epochs=200):
         a3_list = []
 
         I = torch.eye(model.kv_n, device=x_gene_tensor.device)
-        scale = math.sqrt(model.q_dim)
+        scale = math.sqrt(model.hidden)
 
         model.eval()
         with torch.no_grad():
             for i in range(0, x_gene_tensor.shape[0], batch_size):
                 batch = x_gene_tensor[i:i+batch_size]
-                e1 = model.encoder1(batch)
-                q1 = model.q_net1(e1)
+                q1 = model.encoder1(batch)
                 ker = model.keys1(I)
                 var = model.values1(I)
                 attn_logits1 = (q1 @ ker.T) / scale
@@ -937,8 +1156,7 @@ def rnaadtmapping(output_path, adata, *args, num_epochs=200):
 
             for i in range(0, x_adt_tensor.shape[0], batch_size):
                 batch = x_adt_tensor[i:i+batch_size]
-                e3 = model.encoder3(batch)
-                q3 = model.q_net3(e3)
+                q3 = model.encoder3(batch)
                 kea = model.keys3(I)
                 vaa = model.values3(I)
                 attn_logits3 = (q3 @ kea.T) / scale
@@ -1018,8 +1236,6 @@ def rnaatacadtmappingandimputing(output_path, rna, atac, adt, *args, num_epochs=
             Hidden dimension for all layers in the network
         z_dim : int
             Dimension of the latent space
-        q_dim : int
-            Dimension of the query vector (Q) in attention
         kv_n : int
             Number of key-value (K-V) pairs in attention
         genes_of_interest : list[str]
@@ -1037,7 +1253,7 @@ def rnaatacadtmappingandimputing(output_path, rna, atac, adt, *args, num_epochs=
         Results are stored in rna.obsm and written to the specified h5ad file.
     """
     
-    n_hidden, hidden, z_dim, q_dim, kv_n, genes_of_interest, peaks_of_interest, adts_of_interest = args
+    n_hidden, hidden, z_dim, kv_n, genes_of_interest, peaks_of_interest, adts_of_interest = args
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     z1_index = rna.obs_names[rna.obs["Modality"] == "multiome"].tolist()
@@ -1072,41 +1288,66 @@ def rnaatacadtmappingandimputing(output_path, rna, atac, adt, *args, num_epochs=
     train_loader = DataLoader(dataset_t, batch_size=512, shuffle=True)
     test1_loader = DataLoader(dataset_t, batch_size=512, shuffle=False)
 
-    model = multigai(rna_dim, atac_dim, adt_dim, n_hidden, hidden, z_dim, batch_encoded.shape[1], q_dim, kv_n).to(device)
+    model = multigai(rna_dim, atac_dim, adt_dim, n_hidden, hidden, z_dim, batch_encoded.shape[1], kv_n).to(device)
     optimizer_main = Adam(model.parameters(), lr=0.001)
     scheduler_main = torch.optim.lr_scheduler.StepLR(optimizer_main, step_size=50, gamma=0.9)
 
-    for epoch in range(num_epochs):
-        running_loss = 0.0
-        kl_weight = 0.0 if epoch < 100 else 0.1
-        model.train()
-        
-        for batch_data in train_loader:
-            optimizer_main.zero_grad()
+    # === Main Model Training Loop with Progress Bar (per-sub-batch update) ===
+tqdm_bar = tqdm(range(num_epochs), desc="Training Progress")
 
-            m_values = batch_data[3] 
-            unique_m = m_values.unique().tolist()  
-            random.shuffle(unique_m)  
+for epoch in tqdm_bar:
+    running_loss = 0.0
 
-            for m_curr in unique_m:
-                mask = (m_values == m_curr)
-                if mask.any():
-                    sub_batch = [d[mask] for d in batch_data]
-                    m1, m2, m3, m_tensor, batch_tensor, idx = [x.to(device) for x in sub_batch]
+    # KL warm-up
+    kl_weight = 0.0 if epoch < 100 else 0.1
+    model.train()
 
-                    z, p1, p2, p3, qz, pz, a1, a2, a3, aq, ae = model(
-                        m1, m2, m3, int(m_curr), batch_tensor
-                    )
-                    loss, reconst_loss, kl_loss, cos_loss = model.loss_function(
-                        m1, m2, m3, int(m_curr), p1, p2, p3, qz, pz, a1, a2, a3, kl_weight
-                    )
-                    loss.backward()
-                    optimizer_main.step()
+    for batch_data in train_loader:
+        optimizer_main.zero_grad()
 
-                    running_loss += loss.item()
+        m_values = batch_data[3]              # modality indicator
+        unique_m = m_values.unique().tolist()
+        random.shuffle(unique_m)
 
-        scheduler_main.step()
-        print(f"[Epoch {epoch+1}/{num_epochs}] Loss: {running_loss/len(train_loader):.4f}, KL_weight: {kl_weight}")
+        # === each modality sub-batch updates parameters independently ===
+        for m_curr in unique_m:
+            mask = (m_values == m_curr)
+            if not mask.any():
+                continue
+
+            # sub-batch
+            sub_batch = [d[mask] for d in batch_data]
+            m1, m2, m3, m_tensor, batch_tensor, idx = [
+                x.to(device) for x in sub_batch
+            ]
+
+            # forward
+            z, p1, p2, p3, qz, pz, a1, a2, a3, aq, ae = model(
+                m1, m2, m3, int(m_curr), batch_tensor
+            )
+
+            # loss
+            loss, reconst_loss, kl_loss, cos_loss = model.loss_function(
+                m1, m2, m3, int(m_curr),
+                p1, p2, p3, qz, pz,
+                a1, a2, a3,
+                kl_weight
+            )
+
+            # backward + step (per sub-batch)
+            loss.backward()
+            optimizer_main.step()
+
+            running_loss += loss.item()
+
+    scheduler_main.step()
+
+    avg_loss = running_loss / len(train_loader)
+
+    tqdm_bar.set_postfix({
+        "loss": f"{avg_loss:.4f}",
+        "KL_weight": f"{kl_weight:.3f}"
+    })
 
     model.eval()
 
@@ -1156,27 +1397,6 @@ def rnaatacadtmappingandimputing(output_path, rna, atac, adt, *args, num_epochs=
     a1_z2_tensor = torch.cat([a1_z2_dict[name] for name in z2_index], dim=0)
     a3_tensor = torch.cat([a3_dict[name] for name in z2_index], dim=0)
     ae_z2_tensor = torch.cat([ae_z2_dict[name] for name in z2_index], dim=0)
-
-    def train_mlp(x_tensor, y_tensor, input_dim, output_dim, epochs=200):
-        dataset = torch.utils.data.TensorDataset(x_tensor, y_tensor)
-        loader = DataLoader(dataset, batch_size=512, shuffle=True)
-        mlp = M2L(input_dim, output_dim).to(device)
-        optimizer = Adam(mlp.parameters(), lr=1e-3)
-        criterion = nn.MSELoss()
-        mlp.train()
-        for epoch in range(epochs):
-            running_loss = 0.0
-            for x, y in loader:
-                optimizer.zero_grad()
-                x, y = x.to(device), y.to(device)
-                y_pred = mlp(x)
-                loss = criterion(y_pred, y)
-                loss.backward()
-                optimizer.step()
-                running_loss += loss.item()
-            if (epoch+1) % 50 == 0:
-                print(f"[MLP Epoch {epoch+1}/{epochs}] Loss: {running_loss/len(loader):.4f}")
-        return mlp
 
     a1_tensor_full = torch.cat([a1_z1_tensor, a1_z2_tensor], dim=0)
     ae_a1_full = torch.cat([ae_z1_tensor, ae_z2_tensor], dim=0)
@@ -1231,15 +1451,14 @@ def rnaatacadtmappingandimputing(output_path, rna, atac, adt, *args, num_epochs=
         a3_list = []
 
         I = torch.eye(model.kv_n, device=x_gene_tensor.device) 
-        scale = math.sqrt(model.q_dim)
+        scale = math.sqrt(model.hidden)
 
         model.eval()
         with torch.no_grad():
 
             for i in range(0, x_gene_tensor.shape[0], batch_size):
                 batch = x_gene_tensor[i:i+batch_size]
-                e1 = model.encoder1(batch)
-                q1 = model.q_net1(e1)
+                q1 = model.encoder1(batch)
                 ker = model.keys1(I)
                 var = model.values1(I)
                 attn_logits1 = (q1 @ ker.T) / scale
@@ -1248,8 +1467,7 @@ def rnaatacadtmappingandimputing(output_path, rna, atac, adt, *args, num_epochs=
 
             for i in range(0, x_peaks_tensor.shape[0], batch_size):
                 batch = x_peaks_tensor[i:i+batch_size]
-                e2 = model.encoder2(batch)
-                q2 = model.q_net2(e2)
+                q2 = model.encoder2(batch)
                 kea = model.keys2(I)
                 vaa = model.values2(I)
                 attn_logits2 = (q2 @ kea.T) / scale
@@ -1258,8 +1476,7 @@ def rnaatacadtmappingandimputing(output_path, rna, atac, adt, *args, num_epochs=
 
             for i in range(0, x_adt_tensor.shape[0], batch_size):
                 batch = x_adt_tensor[i:i+batch_size]
-                e3 = model.encoder3(batch)
-                q3 = model.q_net3(e3)
+                q3 = model.encoder3(batch)
                 kea = model.keys3(I)
                 vaa = model.values3(I)
                 attn_logits3 = (q3 @ kea.T) / scale
@@ -1403,13 +1620,13 @@ def train_and_evaluate_model(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Unpack model hyperparameters
-    input_dim1, input_dim2, input_dim3, n_hidden, hidden, z_dim, batch_dim, q_dim, kv_n = args
+    input_dim1, input_dim2, input_dim3, n_hidden, hidden, z_dim, batch_dim, kv_n = args
 
     # Initialize model
     model = multigai(
         input_dim1, input_dim2, input_dim3,
         n_hidden, hidden, z_dim,
-        batch_dim, q_dim, kv_n
+        batch_dim, kv_n
     ).to(device)
 
     # Optimizer and learning rate scheduler
@@ -1489,7 +1706,6 @@ def train_and_evaluate_model(
             "recon": f"{running_recon / n_batches:.4f}",
             "kl": f"{running_kl / n_batches:.4f}",
             "cos": f"{running_cos / n_batches:.4f}",
-            "w": f"{kl_weight:.3f}"
         })
 
         scheduler_main.step()
@@ -1524,4 +1740,410 @@ def train_and_evaluate_model(
 
     # Save latent representation to AnnData
     adata.obsm['latent'] = z_all.cpu().numpy()
+    adata.write_h5ad(output_path)
+
+def spatialintegratingandpredicting(output_path, adata, *args, num_epochs=200):
+    """
+    This function performs spatial transcriptomics integration and prediction.
+
+    Main objectives:
+    1) Integrate RNA-seq and spatial transcriptomics data
+    2) Jointly model gene expression, spatial coordinates (x, y),
+       and slide (slice) identifiers
+    3) Learn a unified latent representation across modalities
+    4) Predict the expression of specified genes at given spatial locations
+       based on spatial coordinates and slice identity
+    5) Save latent representations and predicted gene expression
+       into an AnnData object
+    """
+
+    # ===================== Parse model hyperparameters =====================
+    (
+        n_hidden,        # Number of hidden layers
+        hidden,          # Hidden layer dimension
+        z_dim,           # Latent dimension
+        kv_n,            # Key/value dimension for attention
+        genes_to_check,  # List of genes to be predicted
+    ) = args
+
+    # ===================== Preprocessing =====================
+    # Normalize total counts per cell and log-transform
+    sc.pp.normalize_total(adata, target_sum=1e4)
+    sc.pp.log1p(adata)
+
+    # Select highly variable genes across batches
+    sc.pp.highly_variable_genes(
+        adata, n_top_genes=4000, batch_key='batch'
+    )
+    adata = adata[:, adata.var.highly_variable].copy()
+
+    # ===================== Split RNA and spatial observations =====================
+    adata_rna = adata[adata.obs['mapping'] == 'rna'].copy()
+
+    # Store original indices for RNA and spatial observations
+    z1_index = adata.obs_names[adata.obs['mapping'] == 'rna'].tolist()
+    z2_index = adata.obs_names[adata.obs['mapping'] == 'spatial'].tolist()
+
+    # ===================== Spatial coordinates =====================
+    spatial_x = adata.obs["spatial_x"].values.astype(float)
+    spatial_y = adata.obs["spatial_y"].values.astype(float)
+
+    x_min, x_max = spatial_x.min(), spatial_x.max()
+    y_min, y_max = spatial_y.min(), spatial_y.max()
+
+    # Normalize spatial coordinates to [0, 1]
+    def norm_coord(x, y):
+        return np.stack([
+            (x - x_min) / (x_max - x_min),
+            (y - y_min) / (y_max - y_min)
+        ], axis=1)
+
+    # ===================== Fourier positional encoding =====================
+    # Enhances spatial representation by multi-frequency encoding
+    def fourier_encode(coord, num_freqs=6):
+        feats = []
+        for f in 2 ** np.arange(num_freqs):
+            feats.append(np.sin(2 * np.pi * f * coord))
+            feats.append(np.cos(2 * np.pi * f * coord))
+        return np.concatenate(feats, axis=1)
+
+    # ===================== Slice (slide) encoding =====================
+    slice_ids_all = adata.obs['spatial_serial'].astype(
+        'category'
+    ).cat.codes.values
+    slice_ids_rna = adata_rna.obs['spatial_serial'].astype(
+        'category'
+    ).cat.codes.values
+
+    num_slices = np.unique(slice_ids_all).size
+    d_slice = 8  # Dimension of slice embedding
+
+    # ===================== Batch one-hot encoding =====================
+    batch_codes_all = adata.obs['batch'].astype(
+        'category'
+    ).cat.codes.values
+    batch_codes_all = torch.tensor(batch_codes_all, dtype=torch.long)
+    batch_encoded_all = torch.nn.functional.one_hot(batch_codes_all)
+
+    batch_codes_rna = batch_encoded_all[
+        adata.obs['mapping'] == 'rna'
+    ]
+    batch_dim = batch_encoded_all.shape[1]
+
+    # ===================== RNA expression matrices =====================
+    rna_rna = adata_rna.layers['counts']
+    rna_all = adata.layers['counts']
+
+    if issparse(rna_rna):
+        rna_rna = rna_rna.toarray()
+    if issparse(rna_all):
+        rna_all = rna_all.toarray()
+
+    rna_dim = rna_rna.shape[1]
+
+    # ===================== Construct spatial features =====================
+    coord_rna = norm_coord(
+        spatial_x[adata.obs['mapping'] == 'rna'],
+        spatial_y[adata.obs['mapping'] == 'rna']
+    )
+    coord_all = norm_coord(spatial_x, spatial_y)
+
+    coord_rna_fourier = fourier_encode(coord_rna)
+    coord_all_fourier = fourier_encode(coord_all)
+
+    coord_rna_tensor = torch.tensor(coord_rna, dtype=torch.float32)
+    coord_all_tensor = torch.tensor(coord_all, dtype=torch.float32)
+
+    coord_rna_fourier_tensor = torch.tensor(
+        coord_rna_fourier, dtype=torch.float32
+    )
+    coord_all_fourier_tensor = torch.tensor(
+        coord_all_fourier, dtype=torch.float32
+    )
+
+    # ===================== Build training and test datasets =====================
+    train_dataset = MultiOmicsDataset(
+        rna_rna,
+        coord_rna_fourier,
+        coord_rna_tensor,
+        slice_ids_rna,
+        batch_codes_rna
+    )
+
+    test_dataset = MultiOmicsDataset(
+        rna_all,
+        coord_all_fourier,
+        coord_all_tensor,
+        slice_ids_all,
+        batch_encoded_all
+    )
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=512, shuffle=True
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=512, shuffle=False
+    )
+
+    # Spatial input dimension = Fourier features + slice embedding
+    spatial_dim = coord_all_fourier.shape[1] + d_slice
+
+    device = torch.device(
+        "cuda" if torch.cuda.is_available() else "cpu"
+    )
+
+    # ===================== Initialize spatial MultiGAI model =====================
+    model = multigai_spatial(
+        rna_dim,
+        spatial_dim,
+        n_hidden,
+        hidden,
+        z_dim,
+        batch_dim,
+        kv_n,
+        num_slices,
+        d_slice,
+    ).to(device)
+
+    # ===================== Optimizer and scheduler =====================
+    optimizer_main = Adam(model.parameters(), lr=0.001)
+    scheduler_main = torch.optim.lr_scheduler.StepLR(
+        optimizer_main, step_size=50, gamma=0.9
+    )
+
+    tqdm_bar = tqdm(range(num_epochs), desc="Training Progress")
+
+    # ===================== Model training =====================
+    for epoch in tqdm_bar:
+        running_loss = 0.0
+        running_recon = 0.0
+        running_spatial = 0.0
+        running_kl = 0.0
+        running_cos = 0.0
+
+        # KL warm-up strategy
+        kl_weight = 0.0 if epoch < 100 else 0.1
+
+        model.train()
+
+        for batch_data in train_loader:
+            optimizer_main.zero_grad()
+
+            r = batch_data[0].to(device)              # RNA expression
+            coord_fourier = batch_data[1].to(device) # Fourier spatial encoding
+            c = batch_data[2].to(device)             # Raw spatial coordinates
+            slice_ids = batch_data[3].to(device).long()
+            batch_tensor = batch_data[4].to(device)  # Batch one-hot vector
+
+            # Concatenate spatial encoding and slice embedding
+            slice_feat = model.slice_embedding(slice_ids)
+            s = torch.cat([coord_fourier, slice_feat], dim=-1)
+
+            # Forward pass
+            z, p, qz, pz, out2, aq, q_s, eq = model.forward(
+                r, s, batch_tensor
+            )
+
+            # Compute total loss:
+            # reconstruction + spatial loss + KL divergence + cosine loss
+            loss, reconst_loss, loss_spatial, kl_loss, loss_cos = (
+                model.loss_function(
+                    r, p, c, out2, qz, pz, aq, q_s, kl_weight
+                )
+            )
+
+            loss.backward()
+            optimizer_main.step()
+
+            running_loss += loss.item()
+            running_recon += reconst_loss.item()
+            running_spatial += loss_spatial.item()
+            running_kl += kl_loss.item()
+            running_cos += loss_cos.item()
+
+        n_batches = len(train_loader)
+        tqdm_bar.set_postfix({
+            "loss": f"{running_loss / n_batches:.4f}",
+            "recon": f"{running_recon / n_batches:.4f}",
+            "spatial": f"{running_spatial / n_batches:.4f}",
+            "kl": f"{running_kl / n_batches:.4f}",
+            "cos": f"{running_cos / n_batches:.4f}",
+            "w": f"{kl_weight:.3f}"
+        })
+
+        scheduler_main.step()
+
+    # ===================== Latent inference for all observations =====================
+    model.eval()
+
+    latent_list = []
+    q_s_list = []
+    eq_list = []
+
+    with torch.no_grad():
+        for batch_data in test_loader:
+            r = batch_data[0].to(device)
+            coord_fourier = batch_data[1].to(device)
+            slice_ids = batch_data[3].to(device).long()
+
+            slice_feat = model.slice_embedding(slice_ids)
+            s = torch.cat([coord_fourier, slice_feat], dim=-1)
+
+            batch_tensor = batch_data[4].to(device)
+
+            z, p, qz, pz, out2, aq, q_s, eq = model.forward(
+                r, s, batch_tensor
+            )
+
+            latent_list.append(z.cpu())
+            q_s_list.append(q_s.cpu())
+            eq_list.append(eq.cpu())
+
+    z_all = torch.cat(latent_list, dim=0)
+    q_s_all = torch.cat(q_s_list, dim=0)
+    eq_all = torch.cat(eq_list, dim=0)
+
+    # Store latent representations
+    adata.obsm['latent'] = z_all.numpy()
+    adata.obsm['rnaandspatial'] = z_all.numpy()
+
+    # ===================== Train MLP: spatial latent -> expression latent =====================
+    rna_idx = np.where(adata.obs['mapping'] == 'rna')[0]
+    q_s_rna = q_s_all[rna_idx, :]
+    eq_rna = eq_all[rna_idx, :]
+
+    mlp = train_mlp(
+        q_s_rna,
+        eq_rna,
+        q_s_rna.shape[1],
+        eq_rna.shape[1]
+    )
+
+    # Batched MLP inference
+    def infer_mlp(mlp, x_tensor):
+        batch_size = 512
+        preds = []
+        mlp.eval()
+        with torch.no_grad():
+            for i in range(0, x_tensor.shape[0], batch_size):
+                batch = x_tensor[i:i+batch_size]
+                preds.append(mlp(batch))
+        return torch.cat(preds, dim=0)
+
+    # ===================== Predict expression latent for spatial spots =====================
+    spatial_idx = np.where(adata.obs['mapping'] == 'spatial')[0]
+
+    slice_ids_spatial = torch.tensor(
+        slice_ids_all[spatial_idx], dtype=torch.long
+    )
+    coord_fourier_spatial = coord_all_fourier[spatial_idx]
+
+    coord_fourier_spatial = torch.tensor(
+        coord_fourier_spatial, dtype=torch.float32
+    ).to(device)
+    slice_ids_spatial = slice_ids_spatial.to(device)
+
+    # Convert spatial coordinates to spatial latent q_s
+    def coords_to_qs(coord_fourier, slice_ids, model, batch_size=512):
+        model.eval()
+        qs_list = []
+        for i in range(0, coord_fourier.shape[0], batch_size):
+            batch_coords = coord_fourier[i:i+batch_size]
+            batch_slices = slice_ids[i:i+batch_size]
+
+            slice_feat = model.slice_embedding(batch_slices)
+            s = torch.cat([batch_coords, slice_feat], dim=-1)
+            q_s = model.encoder_s(s)
+
+            qs_list.append(q_s)
+        return torch.cat(qs_list, dim=0)
+
+    q_s_spatial = coords_to_qs(
+        coord_fourier_spatial, slice_ids_spatial, model
+    )
+
+    e_tensor = infer_mlp(mlp.to(device), q_s_spatial)
+
+    # ===================== Sample latent z from predicted expression latent =====================
+    def e_to_z(e_tensor):
+        batch_size = 512
+        z_list = []
+        with torch.no_grad():
+            for i in range(0, e_tensor.shape[0], batch_size):
+                batch = e_tensor[i:i+batch_size]
+                mu = model.m_net(batch)
+                logvar = model.l_net(batch)
+                var = torch.exp(logvar) + 1e-8
+                qz = Normal(mu, var.sqrt())
+                z_list.append(qz.rsample())
+        return torch.cat(z_list, dim=0)
+
+    z2_tensor = e_to_z(e_tensor)
+
+    # ===================== Fill spatial latent back into AnnData =====================
+    latent_dim = z2_tensor.shape[1]
+    latent_matrix = torch.full(
+        (adata.n_obs, latent_dim),
+        float('nan'),
+        device=device
+    )
+
+    adata_index = adata.obs_names.values
+    adata_mapping = {cell: i for i, cell in enumerate(adata_index)}
+
+    def fill_latent(tensor, tensor_index):
+        idx = [adata_mapping[cell] for cell in tensor_index]
+        latent_matrix[idx, :] = tensor
+
+    fill_latent(z2_tensor, z2_index)
+
+    adata.obsm['onlyspatial'] = latent_matrix.cpu().numpy()
+
+    # Merge RNA and spatial latent representations
+    spatial_mask = adata.obs['mapping'] == 'spatial'
+    latent_new = adata.obsm['latent'].copy()
+    latent_new[spatial_mask.values] = adata.obsm['onlyspatial'][spatial_mask.values]
+    adata.obsm['latent'] = latent_new
+
+    # ===================== Gene expression prediction =====================
+    latent_tensor = torch.tensor(
+        adata.obsm['latent'], dtype=torch.float32, device=device
+    )
+
+    batch_encoded = batch_encoded_all.to(device)
+
+    gene_name_to_idx = {
+        gene: idx for idx, gene in enumerate(adata.var_names)
+    }
+
+    pred_matrix = torch.full(
+        (latent_tensor.shape[0], len(genes_to_check)),
+        float('nan'),
+        device=device
+    )
+
+    with torch.no_grad():
+        for i, gene in enumerate(genes_to_check):
+            gene_idx = gene_name_to_idx.get(gene, None)
+
+            dz = latent_tensor
+            for layer in model.decoder_base:
+                dz = torch.cat([dz, batch_encoded], dim=1)
+                dz = layer(dz)
+
+            final = torch.cat([dz, batch_encoded], dim=1)
+
+            scale = model.fc_scale(final)
+            dropout = model.fc_dropout(final)
+
+            # Expected expression value
+            expectation = (1 - torch.sigmoid(dropout)) * scale
+
+            pred_matrix[:, i] = expectation[:, gene_idx]
+
+    # Store predicted gene expression in adata.obsm
+    for j, gene in enumerate(genes_to_check):
+        adata.obsm[gene] = pred_matrix[:, j].cpu().numpy()
+
+    # ===================== Save results =====================
     adata.write_h5ad(output_path)
