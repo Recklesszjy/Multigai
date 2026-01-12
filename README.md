@@ -49,6 +49,15 @@ conda activate multigai
 ---
 
 ## Usage
+
 Please refer to the source code `MultiGAI.py` and the tutorial `tutorial.ipynb`.
+
+---
+
+## Citation
+
+If you use this code, please cite our paper:
+
+[DOI:10.64898/2025.12.18.692200](https://doi.org/10.64898/2025.12.18.692200)
 
 
