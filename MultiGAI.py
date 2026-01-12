@@ -1742,6 +1742,109 @@ def train_and_evaluate_model(
     adata.obsm['latent'] = z_all.cpu().numpy()
     adata.write_h5ad(output_path)
 
+def train_and_evaluate_singlemodel(
+    output_path,
+    train_loader,
+    test_loader,
+    rna,              
+    input_dim,
+    n_hidden,
+    hidden,
+    z_dim,
+    batch_dim,
+    kv_n,
+    num_epochs=200
+):
+    """
+    Train MultiGAI single-modal model and extract latent representation.
+
+    Parameters
+    ----------
+    output_path : str
+        Path to save output h5ad
+    train_loader : DataLoader
+    test_loader : DataLoader
+    rna : AnnData
+    input_dim, n_hidden, hidden, z_dim, batch_dim, kv_n : model params
+    num_epochs : int
+    """
+
+    # ===================== Device =====================
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # ===================== Model =====================
+    model = multigai_single(
+        input_dim,
+        n_hidden,
+        hidden,
+        z_dim,
+        batch_dim,
+        kv_n
+    ).to(device)
+
+    optimizer_main = Adam(model.parameters(), lr=1e-3)
+    scheduler_main = torch.optim.lr_scheduler.StepLR(
+        optimizer_main, step_size=50, gamma=0.9
+    )
+
+    # ===================== Training =====================
+    tqdm_bar = tqdm(range(num_epochs), desc="Training Progress")
+
+    for epoch in tqdm_bar:
+        running_loss = 0.0
+        running_recon = 0.0
+        running_kl = 0.0
+
+        # KL annealing
+        kl_weight = 0.0 if epoch < 100 else 0.1
+        model.train()
+
+        for batch_data in train_loader:
+            optimizer_main.zero_grad()
+
+            m = batch_data[0].to(device)
+            batch = batch_data[4].to(device)
+
+            z, p, qz, pz = model(m, batch)
+
+            loss, recon_loss, kl_loss = model.loss_function(
+                m, p, qz, pz, kl_weight
+            )
+
+            loss.backward()
+            optimizer_main.step()
+
+            running_loss += loss.item()
+            running_recon += recon_loss.item()
+            running_kl += kl_loss.item()
+
+        n_batches = len(train_loader)
+        tqdm_bar.set_postfix({
+            "loss": f"{running_loss / n_batches:.4f}",
+            "recon": f"{running_recon / n_batches:.4f}",
+            "kl": f"{running_kl / n_batches:.4f}",
+            "w": f"{kl_weight:.3f}",
+        })
+
+        scheduler_main.step()
+
+    # ===================== Inference & Latent Extraction =====================
+    model.eval()
+    z_all = torch.zeros((rna.n_obs, z_dim), device=device)
+
+    with torch.no_grad():
+        for batch_data in test_loader:
+            m = batch_data[0].to(device)
+            batch = batch_data[4].to(device)
+            idx = batch_data[5]   # index
+
+            z, _, _, _ = model(m, batch)
+            z_all[idx.long()] = z
+
+    # ===================== Save =====================
+    rna.obsm["latent"] = z_all.cpu().numpy()
+    rna.write_h5ad(output_path)
+
 def spatialintegratingandpredicting(output_path, adata, *args, num_epochs=200):
     """
     This function performs spatial transcriptomics integration and prediction.
