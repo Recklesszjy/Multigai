@@ -101,6 +101,174 @@ class ZeroInflatedNegativeBinomial(Distribution):
 
         return log_prob
 
+class multigai_single(nn.Module):
+    """
+    MultiGAI: A multi-modal generative integration model.
+
+    This model supports joint representation learning and cross-modality
+    reconstruction using attention-based latent fusion and ZINB decoders.
+    """
+
+    def __init__(
+        self,
+        input_dim,
+        n_hidden,
+        hidden,
+        z_dim,
+        batch_dim,
+        kv_n=64,
+        dropout_rate=0.1
+    ):
+        super().__init__()
+
+        # ===== Hyperparameters =====
+        self.kv_n = kv_n              # Number of key/value tokens
+        self.z_dim = z_dim            # Latent space dimension
+        self.batch_dim = batch_dim    # Batch covariate dimension
+        self.hidden = hidden          # Hidden layer width
+
+        # ===== Shared encoder constructor =====
+        def make_encoder(in_dim):
+            """
+            Build a multi-layer MLP encoder with LayerNorm and Dropout.
+            """
+            layers = []
+            for _ in range(n_hidden):
+                layers.append(
+                    nn.Sequential(
+                        nn.Linear(in_dim, hidden),
+                        nn.LayerNorm(hidden),
+                        nn.ReLU(),
+                        nn.Dropout(dropout_rate)
+                    )
+                )
+                in_dim = hidden
+            layers.append(nn.Linear(hidden, hidden))
+            return nn.Sequential(*layers)
+
+        # ===== Modality-specific encoders =====
+        self.encoder = make_encoder(input_dim)
+
+        # ===== Key / Value network constructor =====
+        def make_kv():
+
+            layers_k = []
+            in_dim = kv_n
+            for _ in range(n_hidden):
+                layers_k.append(
+                    nn.Sequential(
+                        nn.Linear(in_dim, hidden),
+                        nn.LayerNorm(hidden),
+                        nn.ReLU(),
+                        nn.Dropout(dropout_rate)
+                    )
+                )
+                in_dim = hidden
+            layers_k.append(nn.Linear(hidden, hidden))
+            key_net = nn.Sequential(*layers_k)
+
+            layers_v = []
+            in_dim = kv_n
+            for _ in range(n_hidden):
+                layers_v.append(
+                    nn.Sequential(
+                        nn.Linear(in_dim, hidden),
+                        nn.LayerNorm(hidden),
+                        nn.ReLU(),
+                        nn.Dropout(dropout_rate)
+                    )
+                )
+                in_dim = hidden
+            value_net = nn.Sequential(*layers_v)
+
+            return key_net, value_net
+
+        # ===== Modality-specific key/value banks =====
+        self.keys, self.values = make_kv()
+
+        # ===== Latent Gaussian parameter heads =====
+        self.m_net = nn.Linear(hidden, z_dim)   # Mean of q(z|x)
+        self.l_net = nn.Linear(hidden, z_dim)   # Log-variance of q(z|x)
+
+        # ===== Shared decoder backbone =====
+        self.decoder_base = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(z_dim + batch_dim if i == 0 else hidden + batch_dim, hidden),
+                nn.LayerNorm(hidden),
+                nn.ReLU(),
+                nn.Dropout(dropout_rate)
+            ) for i in range(n_hidden)
+        ])
+
+        # ===== ZINB decoders for each modality =====
+        # Modality 1
+        self.fc_scale = nn.Sequential(
+            nn.Linear(hidden + batch_dim, input_dim),
+            nn.Softmax(dim=-1)
+        )
+        self.fc_dropout = nn.Linear(hidden + batch_dim, input_dim)
+        self.fc_r = nn.Parameter(torch.randn(input_dim))  # Dispersion
+
+    def forward(self, m, batch):
+        """
+        Forward pass of MultiGAI.
+        """
+        device = batch.device
+        batch_size = m.size(0)
+
+        q = self.encoder(m)
+        
+        I = torch.eye(self.kv_n, device=device)
+        scale = math.sqrt(self.hidden)
+
+        ker, val = self.keys(I), self.values(I)
+        e = torch.softmax((q @ ker.T) / scale, dim=-1) @ val
+
+        mu = self.m_net(e)
+        logvar = self.l_net(e)
+        var = torch.exp(logvar) + 1e-8
+        var = torch.clamp(var, min=1e-6)
+
+        qz = Normal(mu, var.sqrt())
+        z = qz.rsample()
+        pz = Normal(torch.zeros_like(z), torch.ones_like(z))
+
+        dz = z
+        for layer in self.decoder_base:
+            dz = torch.cat([dz, batch], dim=1)
+            dz = layer(dz)
+
+        final = torch.cat([dz, batch], dim=1)
+
+        scale = self.fc_scale(final)
+        dropout = self.fc_dropout(final)
+        library = torch.log(m.sum(1, keepdim=True) + 1e-8)
+        rate = torch.exp(library) * scale
+
+        p = ZeroInflatedNegativeBinomial(
+            mu=rate,
+            theta=torch.exp(self.fc_r),
+            zi_logits=dropout,
+            scale=scale
+        )
+
+        return z, p, qz, pz
+
+    def loss_function(self, m, p, qz, pz, w):
+        """
+        Compute total loss:
+        reconstruction + KL divergence + cosine alignment loss.
+        """
+        device = m.device
+        cos_loss = torch.tensor(0.0, device=device)
+        
+        reconst_loss = -p.log_prob(m).sum(-1).mean()
+
+        kl = torch.distributions.kl_divergence(qz, pz).sum(dim=-1).mean()
+
+        loss = reconst_loss + w * kl
+        return loss, reconst_loss, kl
+
 class multigai(nn.Module):
     """
     MultiGAI: A multi-modal generative integration model.
@@ -1706,6 +1874,7 @@ def train_and_evaluate_model(
             "recon": f"{running_recon / n_batches:.4f}",
             "kl": f"{running_kl / n_batches:.4f}",
             "cos": f"{running_cos / n_batches:.4f}",
+            "w": f"{kl_weight:.3f}",
         })
 
         scheduler_main.step()
